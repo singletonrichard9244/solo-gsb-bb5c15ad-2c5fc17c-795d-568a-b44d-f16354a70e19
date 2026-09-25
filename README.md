@@ -14,6 +14,8 @@
 
 另提供**双表同段交叉核验**接口：输入两块同时计量同一用量的水表各自的模数、首末秒精度读数与每秒速率上限（两表模数可不同），要求两表**起止时刻分别相同**。各表用量须非负且不超速；按两表读数差的模数同余联立共同用量（中国剩余定理），并与两表可行用量范围求交，返回共同用量的**最小值、最大值、候选数与唯一性**（等差数列端点直接算得，**不逐个枚举回绕圈数**）；同余不相容与范围无交集给出可区分的冲突原因。
 
+另提供**停水时段账单复核**接口：输入现有读数序列、模数、每秒速率上限、账单总用量及若干**左闭右开**的停水时段。停水时段先统一裁剪到读数账期，再合并重叠或相接（端点相同）的时段；每对相邻读数扣除停水后，把剩余的连续供水片段**分别**按 `floor(速率 × 秒数)` 取整并求和作为该段整数用量容量（**不能跨停水时段合并取整**），以此容量限制非负回绕圈数，再用账单总用量联立收紧各段可行圈数。返回各段供水秒数、供水片段明细、用量上下界与唯一性；**单段无解、账单同余冲突与总量超界**分别给出可区分的冲突原因。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -25,6 +27,7 @@ docker compose up --build
 - API 地址：`http://localhost:8000`
 - 用量复核：`POST http://localhost:8000/v1/usage/verify`
 - 账单总量对账：`POST http://localhost:8000/v1/usage/reconcile`
+- 停水时段账单复核：`POST http://localhost:8000/v1/usage/outage-reconcile`
 - 每日用量上下界：`POST http://localhost:8000/v1/usage/daily-range`
 - 换表账单复核：`POST http://localhost:8000/v1/usage/meter-change/reconcile`
 - 漏采读数推断：`POST http://localhost:8000/v1/usage/missing-reading`
@@ -32,6 +35,19 @@ docker compose up --build
 - 双表同段交叉核验：`POST http://localhost:8000/v1/usage/dual-meter/compare`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
+
+例如本机用 curl 调用停水时段账单复核（端口 `8000`）：
+
+```bash
+curl -s http://localhost:8000/v1/usage/outage-reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"modulus":1000,"max_rate_per_second":30,"total_usage":1100,
+       "readings":[{"timestamp":"2026-09-24T00:00:00Z","value":0},
+                   {"timestamp":"2026-09-24T00:00:30Z","value":500},
+                   {"timestamp":"2026-09-24T00:01:00Z","value":100}],
+       "outages":[{"start":"2026-09-24T00:00:10Z","end":"2026-09-24T00:00:20Z"},
+                  {"start":"2026-09-24T00:00:40Z","end":"2026-09-24T00:00:50Z"}]}'
+```
 
 ### 配置
 
@@ -251,6 +267,157 @@ pytest
 - `kind = "total"`，`reason = "total_out_of_range"`：总回绕次数超出各段可行圈数之和 `[Σk_min, Σk_max]`，即可行账单总量不在 `[feasible_min_total, feasible_max_total]` 内。
 
 存在分段无解冲突时不再进行总量推断；总量冲突时 `segments` 为空。`total_usage` 为负数或非整数等请求校验错误返回 `422`。
+
+### `POST /v1/usage/outage-reconcile`
+
+停水时段账单复核。请求体在账单对账接口字段基础上增加 `outages`（若干**左闭右开**的停水时段）；读数、模数、速率、`total_usage` 的校验与 `/v1/usage/reconcile` 完全一致。停水时段允许重叠、相接或部分/全部落在账期之外：服务端先把每个时段裁剪到读数账期 `[首读数时刻, 末读数时刻)`，再合并重叠或相接（端点相同）的时段，裁剪后为空的时段被丢弃。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 30,
+  "total_usage": 1100,
+  "readings": [
+    { "timestamp": "2026-09-24T00:00:00Z", "value": 0 },
+    { "timestamp": "2026-09-24T00:00:30Z", "value": 500 },
+    { "timestamp": "2026-09-24T00:01:00Z", "value": 100 }
+  ],
+  "outages": [
+    { "start": "2026-09-24T00:00:10Z", "end": "2026-09-24T00:00:20Z" },
+    { "start": "2026-09-24T00:00:40Z", "end": "2026-09-24T00:00:50Z" }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `total_usage` | 整数 | `>= 0`，账单总用量（非负整数） |
+| `outages` | 数组 | 可空（缺省为 `[]`，等价于 `/v1/usage/reconcile`）；每项为左闭右开停水时段，`start` / `end` 为秒精度带时区时间戳且 `start < end`；允许账期外、重叠、相接，服务端裁剪合并 |
+| 其余字段 | — | 与 `/v1/usage/verify` 相同 |
+
+**响应（可行且两段均唯一，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 1100,
+  "total_wraps": 1,
+  "outages": [
+    { "start_timestamp": "2026-09-24T00:00:10Z", "end_timestamp": "2026-09-24T00:00:20Z", "seconds": 10 },
+    { "start_timestamp": "2026-09-24T00:00:40Z", "end_timestamp": "2026-09-24T00:00:50Z", "seconds": 10 }
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:00:30Z",
+      "start_reading": 0,
+      "end_reading": 500,
+      "elapsed_seconds": 30,
+      "outage_seconds": 10,
+      "supply_seconds": 20,
+      "total_capacity": 600,
+      "water_fragments": [
+        { "start_timestamp": "2026-09-24T00:00:00Z", "end_timestamp": "2026-09-24T00:00:10Z", "seconds": 10, "capacity": 300 },
+        { "start_timestamp": "2026-09-24T00:00:20Z", "end_timestamp": "2026-09-24T00:00:30Z", "seconds": 10, "capacity": 300 }
+      ],
+      "min_wraps": 0,
+      "max_wraps": 0,
+      "wraps": 0,
+      "usage": 500,
+      "min_usage": null,
+      "max_usage": null,
+      "unique": true
+    },
+    {
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:00:30Z",
+      "end_timestamp": "2026-09-24T00:01:00Z",
+      "start_reading": 500,
+      "end_reading": 100,
+      "elapsed_seconds": 30,
+      "outage_seconds": 10,
+      "supply_seconds": 20,
+      "total_capacity": 600,
+      "water_fragments": [
+        { "start_timestamp": "2026-09-24T00:00:30Z", "end_timestamp": "2026-09-24T00:00:40Z", "seconds": 10, "capacity": 300 },
+        { "start_timestamp": "2026-09-24T00:00:50Z", "end_timestamp": "2026-09-24T00:01:00Z", "seconds": 10, "capacity": 300 }
+      ],
+      "min_wraps": 1,
+      "max_wraps": 1,
+      "wraps": 1,
+      "usage": 600,
+      "min_usage": null,
+      "max_usage": null,
+      "unique": true
+    }
+  ],
+  "conflicts": []
+}
+```
+
+- `outages`：裁剪到读数账期并合并重叠/相接时段后的停水时段，按开始时刻升序；`seconds` 为裁剪后的秒数。
+- `elapsed_seconds` / `outage_seconds` / `supply_seconds`：区间总时长（含停水）/ 落在区间内的停水秒数 / 扣除停水后的供水秒数；恒有 `supply_seconds = elapsed_seconds - outage_seconds`。
+- `water_fragments`：扣除停水后剩余的**连续供水片段**（左闭右开、按时间升序），每项给出秒数与该片段独立取整的容量 `floor(速率 × 秒数)`。
+- `total_capacity`：**各供水片段分别取整后求和**的整数用量容量。注意它可能小于 `floor(速率 × supply_seconds)`——停水把连续供水切断后，各片段的取整余量不能跨停水时段合并。
+- 圈数唯一（`min_wraps == max_wraps`，即 `unique = true`）时给出 `wraps` / `usage`，`min_usage` / `max_usage` 为 `null`；仍有多解时反之，**只给范围不猜测**，且所有可行组合的各段用量之和恒等于 `total_usage`（交叉端点相等：段下界之和与段上界之和的此消彼长由账单固定）。
+
+**仍有多解（`unique = false`）的情形**：同上读数、速率提高到 `200`、账单 `2100` 时，容量各为 `4000`，账单联立后段 0 圈数 `k ∈ {0,1}`（用量 `[500, 1500]`）、段 1 圈数 `k ∈ {1,2}`（用量 `[600, 1600]`），可行组合为 `(500, 1600)` 与 `(1500, 600)`，均严格满足和为账单。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+单段扣除停水后无解（`kind = "segment"`，`reason = "no_solution"`）：速率改为 `10`（容量 `200`）、账单 `1200` 时，两段连满足非负增量的最小用量（500、600）都无法容纳：
+
+```json
+{
+  "status": "conflict",
+  "modulus": 1000,
+  "total_usage": 1200,
+  "total_wraps": null,
+  "outages": [ "……同上……" ],
+  "segments": [],
+  "conflicts": [
+    {
+      "kind": "segment",
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:00:30Z",
+      "start_reading": 0,
+      "end_reading": 500,
+      "elapsed_seconds": 30,
+      "outage_seconds": 10,
+      "supply_seconds": 20,
+      "reason": "no_solution",
+      "detail": "无解：扣除停水后该区间供水 20s，2 个连续供水片段分别 floor(速率×秒数) 的容量之和仅为 200，而满足非负增量的最小总增量已为 500（读数差 500 + 0×1000）；回绕次数需同时满足 k>=0 与 k<=-1，区间为空（各片段分别取整，不能跨停水时段合并取整）",
+      "min_wraps": 0,
+      "max_wraps": -1,
+      "total_capacity": 200,
+      "water_fragments": [ "……两个容量 100 的片段……" ]
+    }
+  ]
+}
+```
+
+账单与模数不相容（`kind = "total"`，`reason = "total_incompatible_modulus"`）：停水只改变各段容量、不改变模 `M` 同余关系，账单余数与首尾读数差不符时冲突，`expected_remainder` 给出应有余数（`total_wraps` 为 `null`）。
+
+账单同余但超出停水后的可行总量（`kind = "total"`，`reason = "total_out_of_range"`）：`feasible_min_total` / `feasible_max_total` 为**扣除停水后**各段最小/最大可行用量之和（各段容量之和随停水收缩，故上界可能远小于无停水时）；此时同余成立，`total_wraps` 给出账单隐含的 `K`。
+
+```json
+{
+  "kind": "total",
+  "reason": "total_out_of_range",
+  "detail": "账单总量超出停水后的可行范围：扣除停水后各段回绕次数均为非负整数且不超过各自供水片段容量之和时，总用量只能在 [1100, 7100]（模数 1000）之内，收到 8100",
+  "feasible_min_total": 1100,
+  "feasible_max_total": 7100,
+  "expected_remainder": null,
+  "total_wraps": 8
+}
+```
+
+冲突优先级：存在单段无解时列出全部无解段（`kind = "segment"`）且不再进行账单联立；各段均可行后才校验账单同余与可行总量。三类原因——**单段无解、账单同余冲突、总量超界**——分别由 `kind` / `reason` 区分。冲突时 `segments` 为空，但 `outages` 与分段冲突中的 `water_fragments` 仍照常返回以便排查。`outages` 缺省或为空数组时，本接口与 `/v1/usage/reconcile` 结果一致（单段即一个覆盖全区间的供水片段）。请求校验错误（停水时段 `start >= end`、缺时区、含亚秒，以及读数越界、时间不递增、负速率、账单为负等）返回 `422`。
 
 ### `POST /v1/usage/daily-range`
 
@@ -942,6 +1109,32 @@ hi_i' = min(k_max_i, K - Σ_{j≠i} k_min_j)
 
 `lo_i' == hi_i'` 的段圈数唯一、确定用量；其余段返回 `[lo_i', hi_i']` 及对应用量范围，不做猜测。
 
+### 停水时段账单复核
+
+停水时段全部按**左闭右开** `[start, end)` 处理。预处理两步：
+
+1. **裁剪到读数账期**：每个停水时段与 `[t_first, t_last)` 求交（`max(start, t_first)`、`min(end, t_last)`），完全在账期外或裁剪后为空者丢弃；
+2. **合并重叠或相接**：按开始时刻排序，当前时段 `start <=` 已合并区间的右端点即并入（故 `[a,b)` 与 `[b,c)` 相接合并为 `[a,c)`）。
+
+对每段相邻读数 `(r1, t1) -> (r2, t2)`，从 `[t1, t2)` 中扣除落在其内的停水时段，剩余若干连续供水片段，第 `j` 片段时长 `s_j` 秒、容量
+
+```
+c_j = floor(max_rate_per_second × s_j)
+```
+
+**各片段分别取整后求和**作为该段整数用量容量 `C = Σ c_j`——不能跨停水时段合并取整：`Σ floor(速率 × s_j) <= floor(速率 × Σ s_j)`，停水切断了连续供水，各片段不足一单位的取整余量无法互相补足。例如速率 `0.5/秒` 时两个 3s 片段容量为 `1 + 1 = 2`，而同样 6 个供水秒若连续则容量为 `floor(3) = 3`。
+
+与每日子段同理，非负整数增量 `delta = (r2 - r1) + k × modulus` 能以非负整数分配到各供水片段（`0 <= x_j <= c_j`、`Σ x_j = delta`）当且仅当 `delta <= C`，故可行圈数为连续整数区间：
+
+```
+k_min = ceil(max(0, r1 - r2) / modulus)
+k_max = floor((C - (r2 - r1)) / modulus)
+```
+
+`k_max < k_min` 即**单段无解**（`no_solution`）。全部段可行后，账单总用量的联立收紧与「账单总量对账」完全相同（同一整数区间公式，**不枚举圈数组合**）：账单与首尾读数差模 `modulus` 不同余即**账单同余冲突**（`total_incompatible_modulus`；停水不影响同余）；总回绕次数超出 `[Σ k_min, Σ k_max]` 即**总量超界**（`total_out_of_range`，可行盒的上下界按停水收缩后的各段容量计算）。
+
+整段停水（无供水片段）时 `C = 0`：平读数（最小非负增量为 0）唯一对应用量 0，任何回绕读数（最小增量为正）均无解。左闭右开边界下，与读数端点相接的停水不会重复扣减，各供水片段秒数之和恰为 `supply_seconds`。
+
 ### 换表账单复核（两表模数可不同）
 
 旧表、新表两段独立，模数 `M1`、`M2` 可以不同。两段真实用量为
@@ -1085,7 +1278,7 @@ u = d1 + k1·M1 = d2 + k2·M2 （k1, k2 为非负整数圈数）
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛与双表同余联立（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛与双表同余联立（Fraction 精确计算）
 tests/
   test_api.py
 Dockerfile

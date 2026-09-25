@@ -22,18 +22,20 @@ from app.core import (
     STATUS_CONFLICT,
     STATUS_NO_SOLUTION,
     STATUS_OK,
+    clip_merge_intervals,
     compare_dual_meter,
     reconcile_meter_total,
     reconcile_total,
     solve_daily_segment,
     solve_minimum_rate,
     solve_missing_reading,
+    solve_outage_segment,
     solve_segment,
 )
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -49,7 +51,12 @@ app = FastAPI(
         "另支持双表同段交叉核验：两块表同时计量同一用量（起止时刻分别"
         "相同），按两表读数差的模数同余联立共同用量并与两表可行用量范围"
         "求交，返回共同用量最小值、最大值、候选数与唯一性，同余不相容与"
-        "范围无交集给出不同原因，不逐个枚举回绕圈数。"
+        "范围无交集给出不同原因，不逐个枚举回绕圈数；"
+        "还支持停水时段账单复核：停水时段（左闭右开）先裁剪到读数账期、"
+        "合并重叠或相接时段，各相邻读数段扣除停水后把剩余连续供水片段"
+        "分别 floor(速率×秒数) 取整求和作为段容量（不跨停水合并取整），"
+        "再以账单总用量联立收紧各段可行圈数，区分单段无解、账单同余"
+        "冲突与总量超界。"
     ),
 )
 
@@ -137,6 +144,53 @@ class MinimumRateRequest(_BaseReadingsRequest):
 
     total_usage: int = Field(
         ge=0, description="账单总用量（非负整数）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 停水时段账单复核请求模型
+# ---------------------------------------------------------------------------
+
+
+class OutageWindow(BaseModel):
+    """一个左闭右开的停水时段 [start, end)，端点均为秒精度带时区时间戳。"""
+
+    start: datetime = Field(
+        description="停水开始时刻（含），秒精度且须带时区，如 2026-09-24T00:00:10Z"
+    )
+    end: datetime = Field(
+        description="停水结束时刻（不含），秒精度且须带时区；时段可部分或全部"
+        "落在读数账期之外，服务端先裁剪到账期再合并重叠或相接时段"
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _normalize_outage_timestamp(cls, v: datetime) -> datetime:
+        return _normalize_utc_second(v)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "OutageWindow":
+        if self.end <= self.start:
+            raise ValueError(
+                "停水时段必须为左闭右开的非空区间："
+                f"start {self.start.isoformat()} 必须早于 end {self.end.isoformat()}"
+            )
+        return self
+
+
+class OutageReconcileRequest(_BaseUsageRequest):
+    """停水时段账单复核请求：读数、模数、速率、账单总量与若干停水时段。
+
+    读数、时间戳、模数与速率校验与 `/v1/usage/verify` 完全一致（复用同一
+    校验）。停水时段允许重叠、相接或部分/全部落在账期之外，服务端统一
+    裁剪到首末读数账期后合并，调用方无需预先整理。
+    """
+
+    total_usage: int = Field(ge=0, description="账单总用量（非负整数）")
+    outages: List[OutageWindow] = Field(
+        default_factory=list,
+        description="若干左闭右开停水时段；先裁剪到读数账期，再合并重叠或相接"
+        "（端点相同）的时段；裁剪后为空（完全在账期外）的时段被丢弃",
     )
 
 
@@ -343,6 +397,132 @@ class ReconcileResponse(BaseModel):
     conflicts: List[
         Union[ReconcileSegmentErrorOut, ReconcileTotalErrorOut]
     ] = Field(description="冲突明细：某段原本无解，或账单总量与模数不相容/超界")
+
+
+# ---------------------------------------------------------------------------
+# 停水时段账单复核接口响应模型
+# ---------------------------------------------------------------------------
+
+
+class WaterFragmentOut(BaseModel):
+    """一个相邻读数区间内、扣除停水后剩余的连续供水片段 [start, end)。"""
+
+    start_timestamp: datetime
+    end_timestamp: datetime
+    seconds: int = Field(description="该供水片段秒数")
+    capacity: int = Field(description="该片段整数容量 floor(速率×秒数)")
+
+
+class OutageWindowOut(BaseModel):
+    """裁剪到读数账期并合并后的一个停水时段 [start, end)。"""
+
+    start_timestamp: datetime
+    end_timestamp: datetime
+    seconds: int = Field(description="该停水时段秒数（裁剪到账期后）")
+
+
+class OutageSegmentRangeOut(BaseModel):
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int = Field(description="区间总时长（含停水），秒")
+    outage_seconds: int = Field(description="落在该区间内的停水秒数")
+    supply_seconds: int = Field(
+        description="扣除停水后的供水秒数（各供水片段秒数之和）"
+    )
+    total_capacity: int = Field(
+        description="各供水片段分别 floor(速率×秒数) 后的整数容量之和"
+    )
+    water_fragments: List[WaterFragmentOut] = Field(
+        description="扣除停水后剩余的连续供水片段（左闭右开），按时间升序；"
+        "各片段分别取整，不跨停水时段合并"
+    )
+    min_wraps: int = Field(description="账单总量约束后仍可行的最小回绕次数")
+    max_wraps: int = Field(description="账单总量约束后仍可行的最大回绕次数")
+    wraps: Optional[int] = Field(
+        default=None, description="圈数唯一时的回绕次数；仍有多解时为 null"
+    )
+    usage: Optional[int] = Field(
+        default=None, description="圈数唯一时该段的确定用量；仍有多解时为 null"
+    )
+    min_usage: Optional[int] = Field(
+        default=None, description="仍有多解时该段用量的下界；圈数唯一时为 null"
+    )
+    max_usage: Optional[int] = Field(
+        default=None, description="仍有多解时该段用量的上界；圈数唯一时为 null"
+    )
+    unique: bool = Field(description="该段回绕圈数是否已被账单总量唯一确定")
+
+
+class OutageSegmentErrorOut(BaseModel):
+    kind: Literal["segment"] = Field(description="冲突层级：分段")
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int = Field(description="区间总时长（含停水），秒")
+    outage_seconds: int = Field(description="落在该区间内的停水秒数")
+    supply_seconds: int = Field(description="扣除停水后的供水秒数")
+    reason: Literal["no_solution"]
+    detail: str
+    min_wraps: int = Field(description="满足非负增量约束的最小回绕次数")
+    max_wraps: int = Field(
+        description="满足供水片段总容量约束的最大回绕次数；小于 min_wraps 表示无解"
+    )
+    total_capacity: int = Field(
+        description="各供水片段 floor(速率×秒数) 容量之和；停水导致其可能小于"
+        "floor(速率×供水总秒数)"
+    )
+    water_fragments: List[WaterFragmentOut] = Field(
+        description="扣除停水后剩余的连续供水片段（左闭右开）"
+    )
+
+
+class OutageTotalErrorOut(BaseModel):
+    kind: Literal["total"] = Field(description="冲突层级：账单总量")
+    reason: Literal[
+        "total_incompatible_modulus", "total_out_of_range"
+    ]
+    detail: str
+    feasible_min_total: int = Field(
+        description="扣除停水后各段最小可行用量之和，即可行账单总量下界（含）"
+    )
+    feasible_max_total: int = Field(
+        description="扣除停水后各段最大可行用量之和，即可行账单总量上界（含）"
+    )
+    expected_remainder: Optional[int] = Field(
+        default=None, description="与模数相容时账单总量应有的模 M 余数"
+    )
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；与模数不相容时为 null",
+    )
+
+
+class OutageReconcileResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    total_usage: int = Field(description="请求给出的账单总用量")
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；单段无解或与模数不相容时为 null",
+    )
+    outages: List[OutageWindowOut] = Field(
+        description="裁剪到读数账期并合并重叠/相接时段后的停水时段，按开始时刻升序"
+    )
+    segments: List[OutageSegmentRangeOut] = Field(
+        description="账单总量约束后的各段结果：供水秒数、容量、圈数/用量上下界与唯一性；冲突时为空"
+    )
+    conflicts: List[
+        Union[OutageSegmentErrorOut, OutageTotalErrorOut]
+    ] = Field(
+        description="冲突明细：某段扣除停水后无解（no_solution），或账单总量"
+        "与模数不相容（total_incompatible_modulus）/ 超出停水后可行总量"
+        "（total_out_of_range）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +984,194 @@ def reconcile_usage(req: ReconcileRequest) -> ReconcileResponse:
         modulus=req.modulus,
         total_usage=req.total_usage,
         total_wraps=result.total_wraps,
+        segments=segments,
+        conflicts=[],
+    )
+
+
+@app.post("/v1/usage/outage-reconcile", response_model=OutageReconcileResponse)
+def reconcile_usage_with_outages(req: OutageReconcileRequest) -> OutageReconcileResponse:
+    """停水时段账单复核：扣除停水后按供水片段分别取整，再以账单总量联立。
+
+    复用现有秒级时间戳、读数范围、模数与速率上限校验。停水时段按左闭
+    右开处理：先统一裁剪到读数账期 ``[首读数时刻, 末读数时刻)``，再合并
+    重叠或相接（端点相同）的时段。对每对相邻读数，从其区间内扣除停水
+    时段，把剩余的连续供水片段分别按 ``floor(速率 × 秒数)`` 取整后求和，
+    作为该段整数用量容量——**不跨停水时段合并取整**。该容量与非负增量
+    一起夹出可行回绕圈数区间；任一区间无解即以分段冲突返回，不做总量
+    联立。各段均可行后，账单总用量经与
+    ``/v1/usage/reconcile`` 相同的整数区间运算收紧各段圈数（账单同余
+    冲突、总量超界原因可区分）。
+    """
+    max_rate = Fraction(req.max_rate_per_second)
+    period_start = req.readings[0].timestamp
+    period_end = req.readings[-1].timestamp
+
+    # 1) 停水时段裁剪到账期并合并重叠/相接（左闭右开）
+    raw_outages = [(w.start, w.end) for w in req.outages]
+    merged = clip_merge_intervals(raw_outages, period_start, period_end)
+    outage_out = [
+        OutageWindowOut(
+            start_timestamp=s,
+            end_timestamp=e,
+            seconds=int((e - s).total_seconds()),
+        )
+        for s, e in merged
+    ]
+
+    def _fragments_out(fragments) -> List[WaterFragmentOut]:
+        return [
+            WaterFragmentOut(
+                start_timestamp=f.start,
+                end_timestamp=f.end,
+                seconds=f.seconds,
+                capacity=f.capacity,
+            )
+            for f in fragments
+        ]
+
+    # 2) 逐段扣除停水、按供水片段分别取整求容量，夹出可行圈数区间
+    solved = []
+    segment_conflicts: List[OutageSegmentErrorOut] = []
+    for i, (a, b) in enumerate(zip(req.readings, req.readings[1:])):
+        seg_result = solve_outage_segment(
+            i,
+            a.value,
+            b.value,
+            a.timestamp,
+            b.timestamp,
+            req.modulus,
+            max_rate,
+            merged,
+        )
+        diff = b.value - a.value
+        if not seg_result.feasible:
+            min_delta = diff + seg_result.min_wraps * req.modulus
+            detail = (
+                f"无解：扣除停水后该区间供水 {seg_result.supply_seconds}s，"
+                f"{len(seg_result.fragments)} 个连续供水片段分别 "
+                f"floor(速率×秒数) 的容量之和仅为 {seg_result.total_capacity}，"
+                f"而满足非负增量的最小总增量已为 {min_delta}"
+                f"（读数差 {diff} + {seg_result.min_wraps}×{req.modulus}）；"
+                f"回绕次数需同时满足 k>={seg_result.min_wraps} 与 "
+                f"k<={seg_result.max_wraps}，区间为空（各片段分别取整，"
+                f"不能跨停水时段合并取整）"
+            )
+            segment_conflicts.append(
+                OutageSegmentErrorOut(
+                    kind="segment",
+                    index=i,
+                    start_timestamp=a.timestamp,
+                    end_timestamp=b.timestamp,
+                    start_reading=a.value,
+                    end_reading=b.value,
+                    elapsed_seconds=seg_result.elapsed_seconds,
+                    outage_seconds=seg_result.outage_seconds,
+                    supply_seconds=seg_result.supply_seconds,
+                    reason=STATUS_NO_SOLUTION,
+                    detail=detail,
+                    min_wraps=seg_result.min_wraps,
+                    max_wraps=seg_result.max_wraps,
+                    total_capacity=seg_result.total_capacity,
+                    water_fragments=_fragments_out(seg_result.fragments),
+                )
+            )
+        else:
+            solved.append((a, b, seg_result))
+
+    if segment_conflicts:
+        return OutageReconcileResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            total_wraps=None,
+            outages=outage_out,
+            segments=[],
+            conflicts=segment_conflicts,
+        )
+
+    # 3) 各段扣除停水后均可行：以账单总用量整数区间联立收紧（复用对账逻辑）
+    diffs = [b.value - a.value for a, b, _ in solved]
+    bounds = [(r.min_wraps, r.max_wraps) for *_, r in solved]
+    result = reconcile_total(diffs, bounds, req.total_usage, req.modulus)
+
+    if result.status == STATUS_CONFLICT:
+        end_minus_start = sum(diffs)
+        expected_remainder = end_minus_start % req.modulus
+        total_conflicts: List[OutageTotalErrorOut] = []
+        for reason in result.conflicts:
+            if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+                detail = (
+                    f"账单总量与模数不相容：总量 B 必须满足 "
+                    f"B ≡ {expected_remainder} (mod {req.modulus})"
+                    f"（首尾读数差为 {end_minus_start}），收到 "
+                    f"{req.total_usage}（余数 {req.total_usage % req.modulus}），"
+                    f"总回绕次数不是整数（停水只影响各段容量，不改变模 M 同余）"
+                )
+            else:  # REASON_TOTAL_OUT_OF_RANGE
+                detail = (
+                    f"账单总量超出停水后的可行范围：扣除停水后各段回绕次数均为"
+                    f"非负整数且不超过各自供水片段容量之和时，总用量只能在 "
+                    f"[{result.feasible_min_total}, {result.feasible_max_total}]"
+                    f"（模数 {req.modulus}）之内，收到 {req.total_usage}"
+                )
+            total_conflicts.append(
+                OutageTotalErrorOut(
+                    kind="total",
+                    reason=reason,  # type: ignore[arg-type]
+                    detail=detail,
+                    feasible_min_total=result.feasible_min_total,
+                    feasible_max_total=result.feasible_max_total,
+                    expected_remainder=(
+                        expected_remainder
+                        if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS
+                        else None
+                    ),
+                    total_wraps=result.total_wraps,
+                )
+            )
+        return OutageReconcileResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            total_wraps=result.total_wraps,
+            outages=outage_out,
+            segments=[],
+            conflicts=total_conflicts,
+        )
+
+    # 4) 可行：圈数唯一者给出确定用量，其余仅给范围，不猜测
+    segments: List[OutageSegmentRangeOut] = []
+    for (a, b, seg), ns in zip(solved, result.narrowed):
+        min_usage, max_usage = ns.usage_bounds(req.modulus)
+        segments.append(
+            OutageSegmentRangeOut(
+                index=ns.index,
+                start_timestamp=a.timestamp,
+                end_timestamp=b.timestamp,
+                start_reading=a.value,
+                end_reading=b.value,
+                elapsed_seconds=seg.elapsed_seconds,
+                outage_seconds=seg.outage_seconds,
+                supply_seconds=seg.supply_seconds,
+                total_capacity=seg.total_capacity,
+                water_fragments=_fragments_out(seg.fragments),
+                min_wraps=ns.min_wraps,
+                max_wraps=ns.max_wraps,
+                wraps=ns.wraps,
+                usage=ns.usage(req.modulus),
+                min_usage=None if ns.unique else min_usage,
+                max_usage=None if ns.unique else max_usage,
+                unique=ns.unique,
+            )
+        )
+
+    return OutageReconcileResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        total_usage=req.total_usage,
+        total_wraps=result.total_wraps,
+        outages=outage_out,
         segments=segments,
         conflicts=[],
     )

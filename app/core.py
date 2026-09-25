@@ -87,6 +87,20 @@
     无同余点两种情形），与同余不相容是不同的冲突原因。候选为等差数列
     u_min, u_min + L, ..., u_max，候选数 (u_max - u_min)/L + 1 由端点
     直接算得，全程整数区间与同余运算，不逐个枚举回绕圈数。
+
+停水时段账单复核（solve_outage_segment）：
+    若干左闭右开的停水时段先统一裁剪到读数账期 [t_first, t_last)，
+    再合并重叠或相接（端点相同）的时段。对每个相邻读数区间，从
+    [t_i, t_{i+1}) 中扣除落在其内的停水时段，剩余的连续供水片段
+    [s, e) 各自独立取整，容量 c = floor(速率 × (e - s))，该段整数
+    用量容量 C = Σ c——各片段分别 floor 后求和，不能跨停水时段合并
+    取整（Σ floor(速率×s_j) <= floor(速率×Σs_j)，停水会损失取整余量）。
+    与跨日子段同理，非负整数增量 delta = diff + k*M 可分配到各供水
+    片段当且仅当 delta <= C，故可行圈数仍为连续整数区间
+        k_min = ceil(max(0, -diff) / M)
+        k_max = floor((C - diff) / M)
+    k_max < k_min 即单段无解。各段均可行后，账单总用量联立直接复用
+    reconcile_total 的整数区间收紧（同余冲突 / 总量超界原因也一致）。
 """
 
 from __future__ import annotations
@@ -422,6 +436,151 @@ def solve_daily_segment(
         subsegments=subsegments,
         min_usages=tuple(min_usages),
         max_usages=tuple(max_usages),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 停水时段账单复核（outage-reconcile）：裁剪/合并停水时段，逐段供水片段取整
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WaterSupplyFragment:
+    """读数区间扣除停水时段后剩余的一个连续供水片段 [start, end)。"""
+
+    start: datetime
+    end: datetime
+    seconds: int
+    capacity: int  # floor(max_rate_per_second * seconds)
+
+
+@dataclass(frozen=True)
+class OutageSegmentResult:
+    """单个读数区间扣除停水时段后的可行回绕次数判定。"""
+
+    index: int
+    feasible: bool
+    # 该区间可行的回绕次数范围；无解时 max_wraps < min_wraps
+    min_wraps: int
+    max_wraps: int
+    fragments: Tuple[WaterSupplyFragment, ...]
+    elapsed_seconds: int  # 区间总时长（含停水）
+    outage_seconds: int  # 落在该区间内的停水秒数
+    supply_seconds: int  # 扣除停水后的供水秒数
+
+    @property
+    def total_capacity(self) -> int:
+        """各供水片段分别 floor(速率×秒数) 后的容量之和。"""
+        return sum(f.capacity for f in self.fragments)
+
+
+def clip_merge_intervals(
+    intervals: Sequence[Tuple[datetime, datetime]],
+    period_start: datetime,
+    period_end: datetime,
+) -> Tuple[Tuple[datetime, datetime], ...]:
+    """把左闭右开时段裁剪到 ``[period_start, period_end)`` 并合并重叠/相接时段。
+
+    相接（前一段右端点 == 后一段左端点）也合并为一个连续区间；完全落在
+    账期外或裁剪后为空（零时长）的时段被丢弃。合并以 UTC 归一化后的
+    时刻比较，输入时间戳由调用方保证为秒精度带时区。
+    """
+    period_start = period_start.astimezone(timezone.utc)
+    period_end = period_end.astimezone(timezone.utc)
+
+    clipped = []
+    for raw_start, raw_end in intervals:
+        s = max(raw_start.astimezone(timezone.utc), period_start)
+        e = min(raw_end.astimezone(timezone.utc), period_end)
+        if s < e:  # 左闭右开：等长为空，丢弃
+            clipped.append((s, e))
+    clipped.sort()
+
+    merged: list = []
+    for s, e in clipped:
+        if merged and s <= merged[-1][1]:  # 重叠或相接（端点相同）即合并
+            if e > merged[-1][1]:
+                merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return tuple(merged)
+
+
+def solve_outage_segment(
+    index: int,
+    start_value: int,
+    end_value: int,
+    start: datetime,
+    end: datetime,
+    modulus: int,
+    max_rate_per_second: Fraction,
+    merged_outages: Sequence[Tuple[datetime, datetime]],
+) -> OutageSegmentResult:
+    """求单个读数区间扣除停水时段后的供水片段与可行回绕次数区间。
+
+    区间 ``[start, end)`` 与已裁剪合并到账期的停水时段（左闭右开、互不
+    重叠、按起点升序）逐个求交，从区间中扣除交集，得到若干连续供水片段；
+    每片段独立按 ``floor(速率 × 秒数)`` 取整，容量之和 ``C`` 即该段整数
+    用量容量（不跨停水时段合并取整）。非负整数增量
+    ``delta = diff + k*M`` 能分配到各供水片段当且仅当 ``delta <= C``，
+    故可行圈数为 ``[k_min, k_max]``（与跨日子段同一论证），``k_max <
+    k_min`` 即单段无解。
+    """
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+
+    fragments: list = []
+    cursor = start_utc
+    outage_seconds = 0
+    for o_start, o_end in merged_outages:
+        # 与本区间无交集的停水跳过（区间已升序；o_end == cursor 为相接，
+        # 交集为空，不应重复扣减）
+        if o_end <= cursor:
+            continue
+        if o_start >= end_utc:
+            break
+        cut_start = max(o_start, cursor)
+        cut_end = min(o_end, end_utc)
+        if cut_start < cut_end:
+            outage_seconds += int((cut_end - cut_start).total_seconds())
+            if cursor < cut_start:
+                fragments.append(
+                    _make_fragment(cursor, cut_start, max_rate_per_second)
+                )
+            cursor = cut_end
+    if cursor < end_utc:
+        fragments.append(_make_fragment(cursor, end_utc, max_rate_per_second))
+
+    elapsed = int((end_utc - start_utc).total_seconds())
+    supply_seconds = elapsed - outage_seconds
+    total_capacity = sum(f.capacity for f in fragments)
+
+    diff = end_value - start_value
+    k_min = 0 if diff >= 0 else (-diff + modulus - 1) // modulus
+    k_max = (total_capacity - diff) // modulus
+
+    return OutageSegmentResult(
+        index=index,
+        feasible=k_max >= k_min,
+        min_wraps=k_min,
+        max_wraps=k_max,
+        fragments=tuple(fragments),
+        elapsed_seconds=elapsed,
+        outage_seconds=outage_seconds,
+        supply_seconds=supply_seconds,
+    )
+
+
+def _make_fragment(
+    start: datetime, end: datetime, max_rate_per_second: Fraction
+) -> WaterSupplyFragment:
+    """构造一个供水片段，秒数与 ``floor(速率×秒数)`` 容量一并算好。"""
+    seconds = int((end - start).total_seconds())
+    return WaterSupplyFragment(
+        start=start,
+        end=end,
+        seconds=seconds,
+        capacity=math.floor(max_rate_per_second * seconds),
     )
 
 
