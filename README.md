@@ -14,6 +14,8 @@
 
 另提供**双表同段交叉核验**接口：输入两块同时计量同一用量的水表各自的模数、首末秒精度读数与每秒速率上限（两表模数可不同），要求两表**起止时刻分别相同**。各表用量须非负且不超速；按两表读数差的模数同余联立共同用量（中国剩余定理），并与两表可行用量范围求交，返回共同用量的**最小值、最大值、候选数与唯一性**（等差数列端点直接算得，**不逐个枚举回绕圈数**）；同余不相容与范围无交集给出可区分的冲突原因。
 
+另提供**停水时段账单复核**接口：输入现有读数序列、模数、每秒速率上限、账单总用量与若干停水时段。停水时段按**左闭右开**处理：先裁剪到读数账期，再合并重叠或首尾相接的时段。对每对相邻读数，扣除停水后把每个剩余连续供水片段分别按 `floor(速率 × 秒数)` 取整并求和，作为该段的整数用量容量（**不跨停水片段合并取整**）；先以此容量限制非负回绕圈数（单段无解给出 `no_feasible_allocation`），再用账单总用量联立收紧各段可行圈数（`total_incompatible_modulus` / `total_out_of_range` 两种冲突可区分），返回各段供水秒数、容量、用量上下界与唯一性。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -30,6 +32,7 @@ docker compose up --build
 - 漏采读数推断：`POST http://localhost:8000/v1/usage/missing-reading`
 - 最小统一速率上限：`POST http://localhost:8000/v1/usage/minimum-rate`
 - 双表同段交叉核验：`POST http://localhost:8000/v1/usage/dual-meter/compare`
+- 停水时段账单复核：`POST http://localhost:8000/v1/usage/outage-reconcile`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
 
@@ -907,6 +910,159 @@ pytest
 
 请求校验错误（两表起止时刻不分别相同、段内时间不递增、缺时区、含亚秒、读数超出该表模数、负速率、模数 < 1 等）返回 `422`。
 
+### `POST /v1/usage/outage-reconcile`
+
+停水时段账单复核。在读数、模数、每秒速率校验之外，额外接收账单总用量 `total_usage` 与停水时段列表 `outage_periods`（可省略或为空）；读数、时间戳、模数、速率的校验规则与 `/v1/usage/verify` 完全一致（复用同一校验）。每个停水时段为**左闭右开**区间 `[start_timestamp, end_timestamp)`，`start` / `end` 均为秒精度带时区时间戳，且 `end` 严格晚于 `start`。
+
+处理顺序：
+
+1. **裁剪**：所有停水时段先与读数账期 `[首读数时刻, 末读数时刻)` 取交集，落在账期外（或仅相接、交集为空）的部分直接丢弃，不构成请求错误；
+2. **合并**：裁剪后按起点排序，凡重叠或首尾相接（左闭右开下 `上一段.end == 下一段.start` 即相接）的时段合并为一个；
+3. **逐段扣减**：对每对相邻读数区间 `[t1, t2)`，扣除落在其中的停水时段，得到若干剩余连续供水片段；每个片段的容量**分别**取整为 `floor(速率 × 片段秒数)`，求和作为该段整数用量容量（不能跨停水片段合并取整）；
+4. **容量限圈数**：该段真实增量 `读数差 + k×模数` 须为非负整数且不超过容量，可行 `k` 为连续整数区间；连最小非负增量都超出容量即单段无解（`no_feasible_allocation`）；
+5. **账单联立**：各段均可行后，以账单总用量用整数区间运算收紧各段圈数范围（与 `/v1/usage/reconcile` 同一收紧公式，不枚举组合）。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 10,
+  "total_usage": 5000,
+  "readings": [
+    { "timestamp": "2026-09-24T00:00:00Z", "value": 100 },
+    { "timestamp": "2026-09-24T00:16:40Z", "value": 200 },
+    { "timestamp": "2026-09-24T00:33:20Z", "value": 100 }
+  ],
+  "outage_periods": [
+    { "start_timestamp": "2026-09-24T00:04:10Z", "end_timestamp": "2026-09-24T00:12:30Z" },
+    { "start_timestamp": "2026-09-24T00:20:50Z", "end_timestamp": "2026-09-24T00:29:10Z" }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `total_usage` | 整数 | `>= 0`，账单总用量（非负整数） |
+| `outage_periods` | 数组 | 可省略/为空；每项 `start_timestamp` / `end_timestamp` 为秒精度带时区时间戳，左闭右开，`end` 严格晚于 `start`；允许相互重叠、相接或落在账期外（裁剪合并后参与计算） |
+| 其余字段 | — | 与 `/v1/usage/verify` 相同（`modulus` / `max_rate_per_second` / `readings`） |
+
+**响应（可行，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 5000,
+  "total_wraps": 5,
+  "outage_periods": [
+    { "start_timestamp": "2026-09-24T00:04:10Z", "end_timestamp": "2026-09-24T00:12:30Z" },
+    { "start_timestamp": "2026-09-24T00:20:50Z", "end_timestamp": "2026-09-24T00:29:10Z" }
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:16:40Z",
+      "start_reading": 100,
+      "end_reading": 200,
+      "elapsed_seconds": 1000,
+      "outage_seconds": 500,
+      "supply_seconds": 500,
+      "capacity": 5000,
+      "fragments": [
+        { "start_timestamp": "2026-09-24T00:00:00Z", "end_timestamp": "2026-09-24T00:04:10Z", "seconds": 250, "capacity": 2500 },
+        { "start_timestamp": "2026-09-24T00:12:30Z", "end_timestamp": "2026-09-24T00:16:40Z", "seconds": 250, "capacity": 2500 }
+      ],
+      "min_wraps": 0,
+      "max_wraps": 4,
+      "wraps": null,
+      "usage": null,
+      "min_usage": 100,
+      "max_usage": 4100,
+      "unique": false
+    },
+    {
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:16:40Z",
+      "end_timestamp": "2026-09-24T00:33:20Z",
+      "start_reading": 200,
+      "end_reading": 100,
+      "elapsed_seconds": 1000,
+      "outage_seconds": 500,
+      "supply_seconds": 500,
+      "capacity": 5000,
+      "fragments": [
+        { "start_timestamp": "2026-09-24T00:16:40Z", "end_timestamp": "2026-09-24T00:20:50Z", "seconds": 250, "capacity": 2500 },
+        { "start_timestamp": "2026-09-24T00:29:10Z", "end_timestamp": "2026-09-24T00:33:20Z", "seconds": 250, "capacity": 2500 }
+      ],
+      "min_wraps": 1,
+      "max_wraps": 5,
+      "wraps": null,
+      "usage": null,
+      "min_usage": 900,
+      "max_usage": 4900,
+      "unique": false
+    }
+  ],
+  "conflicts": []
+}
+```
+
+上例两段各 1000s、速率 10/s，每段中间停水 500s，剩两个 250s 的供水片段，容量 `floor(10×250) + floor(10×250) = 2500 + 2500 = 5000`（分别取整后求和）。账单 5000 隐含总回绕次数 `K=5`：段 1 圈数被收紧到 `[0,4]`、段 2 到 `[1,5]`，均仍有多解故只给范围；两端点此消彼长，`段1下界 + 段2上界 = 段1上界 + 段2下界 = 5000`。
+
+- `outage_periods`（响应）：实际参与计算的停水时段——**裁剪到账期并合并重叠/相接后**的结果，按时序给出，便于核对合并是否正确。
+- `elapsed_seconds`：读数区间总时长（含停水）；`outage_seconds` 为落在该区间内的停水秒数；`supply_seconds` 为各供水片段秒数之和（`elapsed_seconds - outage_seconds`）。
+- `capacity`：各供水片段分别 `floor(速率×秒数)` 后求和的整数用量容量；`fragments` 给出每个剩余连续供水片段的起止时刻、秒数与独立容量（全段停水时为空数组）。
+- 圈数唯一（`min_wraps == max_wraps`，即 `unique = true`）时 `wraps` / `usage` 给出确定值、`min_usage` / `max_usage` 为 `null`；仍有多解时反之，**只给范围不猜测**。所有可行组合的各段用量之和恒等于 `total_usage`。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+扣除停水后某段容量不足（`kind = "segment"`，`reason = "no_feasible_allocation"`）：整段或大段停水导致连满足非负增量的最小用量都无法容纳时
+
+```json
+{
+  "status": "conflict",
+  "modulus": 1000,
+  "total_usage": 200,
+  "total_wraps": null,
+  "outage_periods": [
+    { "start_timestamp": "2026-09-24T00:00:01Z", "end_timestamp": "2026-09-24T00:00:10Z" }
+  ],
+  "segments": [],
+  "conflicts": [
+    {
+      "kind": "segment",
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:00:10Z",
+      "start_reading": 900,
+      "end_reading": 100,
+      "elapsed_seconds": 10,
+      "outage_seconds": 9,
+      "supply_seconds": 1,
+      "capacity": 10,
+      "fragments": [
+        { "start_timestamp": "2026-09-24T00:00:00Z", "end_timestamp": "2026-09-24T00:00:01Z", "seconds": 1, "capacity": 10 }
+      ],
+      "reason": "no_feasible_allocation",
+      "detail": "无可行分配：……回绕次数需同时满足 k>=1 与 k<=0，区间为空，停水片段之间不能合并取整",
+      "min_wraps": 1,
+      "max_wraps": 0
+    }
+  ]
+}
+```
+
+账单总量问题（`kind = "total"`）与 `/v1/usage/reconcile` 同源、可与单段无解区分：
+
+- `reason = "total_incompatible_modulus"`：账单总量与首尾读数差模 `modulus` 不同余，总回绕次数不是整数；`expected_remainder` 给出应有的余数，`total_wraps` 为 `null`。
+- `reason = "total_out_of_range"`：账单同余，但总回绕次数超出各段按**停水后容量**求出的可行圈数之和，即可行账单总量不在 `[feasible_min_total, feasible_max_total]` 内；此时 `total_wraps` 已知。停水会把该上界相对无停水情形收窄。
+
+存在分段冲突时不再做账单联立，多段冲突一并列出，且 `segments` 为空。全段停水但两端读数相同（增量 0）仍是可行的：`supply_seconds = 0`、`capacity = 0`、`fragments` 为空，圈数唯一为 0、用量 0。
+
+请求校验错误（停水时段缺时区、含亚秒、`end` 不严格晚于 `start`，以及读数越界、时间不递增、负速率、账单为负或非整数、模数 < 1 等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -1080,12 +1236,33 @@ u = d1 + k1·M1 = d2 + k2·M2 （k1, k2 为非负整数圈数）
 
 全程仅用整除、`ceil/floor` 与一次扩展欧几里得，无浮点（速率上限仍由 `Fraction` 精确计算），候选数再大也与枚举量无关。`M1 == M2` 时 `L = M`，自然退化为统一模数的同余联立。
 
+### 停水时段账单复核
+
+停水时段均按**左闭右开** `[s, e)` 处理。先把每个时段裁剪到读数账期 `[t_first, t_last)`（取 `[max(s, t_first), min(e, t_last))`，空交集丢弃），再按起点排序并合并所有重叠或相接（`下一段起点 <= 当前段终点`）的时段，得到两两不相交的全局停水序列。
+
+对每段相邻读数 `(r1, t1) -> (r2, t2)`，从 `[t1, t2)` 中扣除全局停水时段，剩余连续供水片段记为 `[a_j, b_j)`、时长 `s_j = b_j - a_j` 秒。每个片段**独立**取整，该段整数用量容量为
+
+```
+C = Σ_j floor(max_rate_per_second × s_j)
+```
+
+注意 `Σ floor(速率 × s_j)` 可能小于 `floor(速率 × Σ s_j)`：被停水隔开的供水秒数**不能跨停水片段合并取整**（这是本接口与普通速率对账的关键差别）。区间真实增量仍为 `delta = (r2 - r1) + k × modulus`（`k >= 0` 整数）。容量均为整数，`delta` 能以非负整数分配到各供水片段（`0 <= x_j <= floor(速率×s_j)`、`Σ x_j = delta`）当且仅当 `delta <= C`，故可行圈数为连续整数区间：
+
+```
+k_min = ceil(max(0, r1 - r2) / modulus)
+k_max = floor((C - (r2 - r1)) / modulus)
+```
+
+`k_max < k_min` 即单段无解（`no_feasible_allocation`）；全段停水时 `C = 0`，此时仅当增量可为 0（读数相同、`k = 0`）才可行。
+
+各段均可行后，账单总用量 `B` 的联立收紧与「账单总量对账」一节完全相同（望远镜相消、同余校验与整数区间收紧公式）：`B ≡ (r_last - r_first) (mod modulus)` 否则 `total_incompatible_modulus`；`K = (B - (r_last - r_first)) / modulus` 须落在各段停水后圈数区间之和 `[Σ k_min, Σ k_max]` 内，否则 `total_out_of_range`（可行总量上下界随响应给出）。固定 `K` 后各段圈数范围由同一整数区间公式收紧，唯一者确定用量，其余只给范围，不猜测。停水跨越某条读数时刻时，由逐段独立扣减自然地把停水秒数分摊到左右两段，无需特殊处理。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛与双表同余联立（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛、双表同余联立与停水片段容量复核（Fraction 精确计算）
 tests/
   test_api.py
 Dockerfile

@@ -48,6 +48,10 @@ def _dual_meter(payload):
     return _post(payload, path="/v1/usage/dual-meter/compare")
 
 
+def _outage_reconcile(payload):
+    return _post(payload, path="/v1/usage/outage-reconcile")
+
+
 # ---------------------------------------------------------------------------
 # 正常场景
 # ---------------------------------------------------------------------------
@@ -2037,3 +2041,504 @@ def test_compare_dual_meter_exact_by_brute_force():
             )
             assert common[0] % result.step == result.residue
     assert checked > 500
+
+
+# ---------------------------------------------------------------------------
+# 停水时段账单复核 /v1/usage/outage-reconcile
+# ---------------------------------------------------------------------------
+
+def _outage_payload(total_usage=1000, rate=10, modulus=1000, values=(100, 200, 100),
+                    times=("2026-09-24T00:00:00Z", "2026-09-24T00:16:40Z",
+                           "2026-09-24T00:33:20Z"),
+                    outage_periods=None):
+    readings = [
+        {"timestamp": t, "value": v}
+        for t, v in zip(times, values)
+    ]
+    return {
+        "modulus": modulus,
+        "max_rate_per_second": rate,
+        "total_usage": total_usage,
+        "readings": readings,
+        "outage_periods": outage_periods or [],
+    }
+
+
+def test_outage_no_outage_matches_reconcile():
+    """无停水时段：结果与普通账单对账一致（容量即整段 floor(速率×秒数)）。"""
+    resp = _outage_reconcile(_outage_payload(5000))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["conflicts"] == []
+    assert body["outage_periods"] == []
+    s1, s2 = body["segments"]
+    # 两段各 1000s，rate=10 -> cap 10000
+    assert s1["supply_seconds"] == 1000 and s1["capacity"] == 10000
+    assert s1["outage_seconds"] == 0
+    assert (s1["min_wraps"], s1["max_wraps"]) == (0, 4)
+    assert (s2["min_wraps"], s2["max_wraps"]) == (1, 5)
+    assert s1["unique"] is False and s2["unique"] is False
+    assert s1["fragments"] == [
+        {
+            "start_timestamp": "2026-09-24T00:00:00Z",
+            "end_timestamp": "2026-09-24T00:16:40Z",
+            "seconds": 1000,
+            "capacity": 10000,
+        }
+    ]
+
+
+def test_outage_periods_default_omitted():
+    """省略 outage_periods 字段等同于无停水。"""
+    payload = _outage_payload(5000)
+    del payload["outage_periods"]
+    resp = _outage_reconcile(payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_outage_clipped_to_billing_period():
+    """停水时段超出账期的部分先裁剪：只保留与账期相交部分。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            5000,
+            outage_periods=[
+                # 早于首读数 100s 开始、晚于末读数 100s 结束
+                {"start_timestamp": "2026-09-23T23:58:20Z",
+                 "end_timestamp": "2026-09-24T00:35:00Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "conflict"
+    # 裁剪后恰为整个账期 [首读数, 末读数)
+    assert body["outage_periods"] == [
+        {"start_timestamp": "2026-09-24T00:00:00Z",
+         "end_timestamp": "2026-09-24T00:33:20Z"}
+    ]
+    # 整账期停水：两段供水 0s、容量 0；读数 100->200 段 k=0 需增量 100 -> 无解
+    seg_conflicts = body["conflicts"]
+    assert seg_conflicts and seg_conflicts[0]["index"] == 0
+    assert seg_conflicts[0]["capacity"] == 0
+    assert seg_conflicts[0]["supply_seconds"] == 0
+    assert seg_conflicts[0]["fragments"] == []
+
+
+def test_outage_overlapping_and_touching_merged():
+    """重叠与首尾相接（左闭右开）的停水时段先合并。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            0,
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:01:00Z"),
+            values=(0, 0),
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:00:10Z",
+                 "end_timestamp": "2026-09-24T00:00:30Z"},
+                {"start_timestamp": "2026-09-24T00:00:20Z",
+                 "end_timestamp": "2026-09-24T00:00:40Z"},  # 重叠
+                {"start_timestamp": "2026-09-24T00:00:40Z",
+                 "end_timestamp": "2026-09-24T00:00:50Z"},  # 相接
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["outage_periods"] == [
+        {"start_timestamp": "2026-09-24T00:00:10Z",
+         "end_timestamp": "2026-09-24T00:00:50Z"}
+    ]
+    seg = body["segments"][0]
+    assert seg["elapsed_seconds"] == 60
+    assert seg["outage_seconds"] == 40
+    assert seg["supply_seconds"] == 20
+    # 供水片段 [0,10) 与 [50,60)
+    assert [(f["seconds"], f["capacity"]) for f in seg["fragments"]] == [
+        (10, 100),
+        (10, 100),
+    ]
+    assert seg["capacity"] == 200
+
+
+def test_outage_fragments_floored_separately():
+    """各供水片段分别 floor(速率×秒数)，不跨停水合并取整。
+
+    rate=1/3、整段 4s 无停水时 floor(4/3)=1；中间停水 2s 后剩两个 1s
+    片段，各自 floor(1/3)=0，容量和为 0——与整段取整结果不同。
+    """
+    resp = _outage_reconcile(
+        _outage_payload(
+            0,
+            rate=1 / 3,
+            modulus=1,
+            values=(0, 0),
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:00:04Z"),
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:00:01Z",
+                 "end_timestamp": "2026-09-24T00:00:03Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    seg = body["segments"][0]
+    assert [f["seconds"] for f in seg["fragments"]] == [1, 1]
+    assert [f["capacity"] for f in seg["fragments"]] == [0, 0]
+    assert seg["capacity"] == 0
+    assert seg["supply_seconds"] == 2
+    assert seg["unique"] is True and seg["wraps"] == 0 and seg["usage"] == 0
+
+
+def test_outage_segment_no_feasible_allocation_conflict():
+    """扣除停水后容量不足以容纳满足非负增量的最小用量：单段无解冲突。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            200,
+            rate=10,
+            values=(900, 100),  # 最小非负增量 200
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:00:10Z"),
+            outage_periods=[
+                # 停水 9s，仅留 1s -> 容量 10 < 200
+                {"start_timestamp": "2026-09-24T00:00:01Z",
+                 "end_timestamp": "2026-09-24T00:00:10Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "segment"
+    assert conflict["index"] == 0
+    assert conflict["reason"] == "no_feasible_allocation"
+    assert conflict["min_wraps"] == 1
+    assert conflict["max_wraps"] == 0
+    assert conflict["capacity"] == 10
+    assert conflict["supply_seconds"] == 1
+    assert conflict["outage_seconds"] == 9
+
+
+def test_outage_whole_segment_flat_readings_feasible_zero():
+    """整段停水但读数不变：唯一可行用量 0（k=0）。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            0,
+            rate=10,
+            values=(42, 42),
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:00:10Z"),
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:00:00Z",
+                 "end_timestamp": "2026-09-24T00:00:10Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    seg = body["segments"][0]
+    assert seg["supply_seconds"] == 0
+    assert seg["capacity"] == 0
+    assert seg["fragments"] == []
+    assert seg["unique"] is True
+    assert (seg["wraps"], seg["usage"]) == (0, 0)
+    assert seg["min_usage"] is None and seg["max_usage"] is None
+
+
+def test_outage_bill_narrows_wraps_uniquely():
+    """停水收窄容量后，账单把原本多解的段圈数唯一确定。
+
+    1000s、rate=10 的平读数段，中间停水 500s -> 两个 250s 片段容量各
+    2500、容量和 5000，k∈[0,4]；账单 3000 隐含 K=3，圈数唯一。
+    """
+    resp = _outage_reconcile(
+        _outage_payload(
+            3000,
+            values=(0, 0),
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:16:40Z"),
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:04:10Z",
+                 "end_timestamp": "2026-09-24T00:12:30Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 3
+    seg = body["segments"][0]
+    assert seg["supply_seconds"] == 500
+    assert [f["seconds"] for f in seg["fragments"]] == [250, 250]
+    assert seg["capacity"] == 5000
+    assert seg["unique"] is True
+    assert (seg["wraps"], seg["usage"]) == (3, 3000)
+    assert seg["min_usage"] is None and seg["max_usage"] is None
+
+
+def test_outage_bill_ranges_sum_to_bill():
+    """停水后多段仍多解：各段用量范围端点此消彼长，之和恒为账单。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            5000,
+            # 两段各 1000s，停水只在各段内部、不跨读数刻，容量各收窄到 5000
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:04:10Z",
+                 "end_timestamp": "2026-09-24T00:12:30Z"},
+                {"start_timestamp": "2026-09-24T00:20:50Z",
+                 "end_timestamp": "2026-09-24T00:29:10Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    s1, s2 = body["segments"]
+    # 容量 5000：段1 diff=100 -> k∈[0,4]；段2 diff=-900 -> k∈[1,5]
+    assert (s1["min_wraps"], s1["max_wraps"]) == (0, 4)
+    assert (s2["min_wraps"], s2["max_wraps"]) == (1, 5)
+    assert (s1["min_usage"], s1["max_usage"]) == (100, 4100)
+    assert (s2["min_usage"], s2["max_usage"]) == (900, 4900)
+    assert s1["min_usage"] + s2["max_usage"] == 5000
+    assert s1["max_usage"] + s2["min_usage"] == 5000
+
+
+def test_outage_total_incompatible_modulus():
+    """停水后各段可行，但账单与模数不同余：total_incompatible_modulus。"""
+    resp = _outage_reconcile(_outage_payload(5500))
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert conflict["expected_remainder"] == 0
+    assert conflict["total_wraps"] is None
+
+
+def test_outage_total_out_of_range_due_to_reduced_capacity():
+    """账单同余但超出停水收窄后的容量上界：total_out_of_range（与同余冲突可区分）。
+
+    无停水时两段容量各 10000、可行总量上界 19000；两段各停水 500s 后
+    容量各 5000，段1 用量至多 4100、段2 至多 4900，可行上界收窄为
+    9000，账单 15000（同余）即超界。
+    """
+    resp = _outage_reconcile(
+        _outage_payload(
+            15000,
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:04:10Z",
+                 "end_timestamp": "2026-09-24T00:12:30Z"},
+                {"start_timestamp": "2026-09-24T00:20:50Z",
+                 "end_timestamp": "2026-09-24T00:29:10Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_out_of_range"
+    assert conflict["expected_remainder"] is None
+    assert conflict["total_wraps"] == 15
+    # 段1 base 100 cap5000 -> k∈[0,4]（用量至多 4100）；
+    # 段2 base 900 -> k∈[1,5]（用量至多 4900）
+    assert conflict["feasible_min_total"] == 1000
+    assert conflict["feasible_max_total"] == 9000
+
+
+def test_outage_segment_conflict_skips_total_check():
+    """存在单段无解时不再做总量推断，且多段冲突一并列出。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            5500,  # 同时也是同余冲突的账单，但分段冲突优先
+            rate=10,
+            values=(900, 100, 900),  # 两段均需至少 1 圈（增量 200）
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:00:10Z",
+                   "2026-09-24T00:00:20Z"),
+            outage_periods=[
+                # 覆盖整个账期：两段供水均为 0
+                {"start_timestamp": "2026-09-24T00:00:00Z",
+                 "end_timestamp": "2026-09-24T00:00:20Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert [c["index"] for c in body["conflicts"]] == [0, 1]
+    assert all(c["kind"] == "segment" for c in body["conflicts"])
+    assert all(c["reason"] == "no_feasible_allocation" for c in body["conflicts"])
+
+
+def test_outage_spanning_reading_boundary_split_per_segment():
+    """停水跨越读数刻：按段分别扣除，两段各自得到一侧供水片段。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            0,
+            rate=10,
+            values=(0, 0, 0),
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:00:10Z",
+                   "2026-09-24T00:00:20Z"),
+            outage_periods=[
+                {"start_timestamp": "2026-09-24T00:00:05Z",
+                 "end_timestamp": "2026-09-24T00:00:15Z"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["outage_periods"] == [
+        {"start_timestamp": "2026-09-24T00:00:05Z",
+         "end_timestamp": "2026-09-24T00:00:15Z"}
+    ]
+    s1, s2 = body["segments"]
+    assert s1["supply_seconds"] == 5 and s1["outage_seconds"] == 5
+    assert s2["supply_seconds"] == 5 and s2["outage_seconds"] == 5
+    assert [f["seconds"] for f in s1["fragments"]] == [5]
+    assert [f["seconds"] for f in s2["fragments"]] == [5]
+
+
+def test_outage_timezone_offset_normalized_to_utc():
+    """停水时段与读数以不同时区表达：换算 UTC 后裁剪/合并/扣除。"""
+    resp = _outage_reconcile(
+        _outage_payload(
+            0,
+            rate=10,
+            values=(0, 0),
+            times=("2026-09-24T08:00:00+08:00", "2026-09-24T08:01:00+08:00"),
+            outage_periods=[
+                # 即 UTC 00:00:10 ~ 00:00:20
+                {"start_timestamp": "2026-09-24T08:00:10+08:00",
+                 "end_timestamp": "2026-09-24T08:00:20+08:00"},
+            ],
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["outage_periods"] == [
+        {"start_timestamp": "2026-09-24T00:00:10Z",
+         "end_timestamp": "2026-09-24T00:00:20Z"}
+    ]
+    seg = body["segments"][0]
+    assert seg["supply_seconds"] == 50
+
+
+def test_outage_reuses_reading_and_rate_validation():
+    """复用现有时间戳/读数/速率校验：非法输入一律 422。"""
+    base = _outage_payload(100)
+
+    def expect_422(mut):
+        import copy
+
+        payload = copy.deepcopy(base)
+        mut(payload)
+        assert _outage_reconcile(payload).status_code == 422
+
+    # 读数越界
+    expect_422(lambda p: p["readings"][1].update(value=1000))
+    # 时间戳不递增
+    expect_422(lambda p: p["readings"][1].update(
+        timestamp="2026-09-24T00:00:00Z"))
+    # 缺时区
+    expect_422(lambda p: p["readings"][0].update(
+        timestamp="2026-09-24T00:00:00"))
+    # 亚秒
+    expect_422(lambda p: p["readings"][0].update(
+        timestamp="2026-09-24T00:00:00.5Z"))
+    # 读数不足 2 条
+    expect_422(lambda p: p.update(readings=p["readings"][:1]))
+    # 负速率
+    expect_422(lambda p: p.update(max_rate_per_second=-1))
+    # 模数 < 1
+    expect_422(lambda p: p.update(modulus=0))
+    # 账单为负、非整数
+    expect_422(lambda p: p.update(total_usage=-1))
+    expect_422(lambda p: p.update(total_usage=12.5))
+    # 停水时段缺时区 / 含亚秒
+    expect_422(lambda p: p["outage_periods"].append(
+        {"start_timestamp": "2026-09-24T00:00:00",
+         "end_timestamp": "2026-09-24T00:00:10Z"}))
+    expect_422(lambda p: p["outage_periods"].append(
+        {"start_timestamp": "2026-09-24T00:00:00Z",
+         "end_timestamp": "2026-09-24T00:00:10.5Z"}))
+    # 停水时段结束不晚于开始（含起止相等，左闭右开为空）
+    expect_422(lambda p: p["outage_periods"].append(
+        {"start_timestamp": "2026-09-24T00:00:10Z",
+         "end_timestamp": "2026-09-24T00:00:10Z"}))
+    expect_422(lambda p: p["outage_periods"].append(
+        {"start_timestamp": "2026-09-24T00:00:20Z",
+         "end_timestamp": "2026-09-24T00:00:10Z"}))
+
+
+# ---------------------------------------------------------------------------
+# 停水裁剪/合并与片段容量核心逻辑精确性：与逐秒暴力结果比对（固定随机种子）
+# ---------------------------------------------------------------------------
+
+def test_outage_core_exact_by_brute_force():
+    """随机小参数下，裁剪合并、供水片段与可行圈数同逐秒网格暴力结果一致。"""
+    from app.core import (
+        clip_and_merge_intervals,
+        solve_outage_segment,
+        subtract_outages,
+    )
+
+    rng = random.Random(20260926)
+    t_start = datetime(2026, 9, 24, tzinfo=timezone.utc)
+    checked = 0
+    for _ in range(3000):
+        modulus = rng.choice([1, 2, 3, 5, 7, 10])
+        rate = Fraction(rng.randint(0, 10), rng.randint(1, 3))
+        elapsed = rng.randint(1, 12)
+        r1, r2 = rng.randrange(modulus), rng.randrange(modulus)
+        start = t_start
+        end = start + timedelta(seconds=elapsed)
+
+        raw = []
+        for _ in range(rng.randint(0, 4)):
+            s = rng.randint(-3, elapsed + 1)
+            e = s + rng.randint(0, 6)  # 允许空时段与账期外时段
+            raw.append(
+                (start + timedelta(seconds=s), start + timedelta(seconds=e))
+            )
+        merged = clip_and_merge_intervals(raw, start, end)
+        for s, e in merged:
+            assert start <= s < e <= end
+        for (_, e1), (s2, _) in zip(merged, merged[1:]):
+            assert s2 > e1  # 相接时段已合并
+
+        # 逐秒网格：被停水覆盖的整秒（左闭右开）
+        outage_secs = set()
+        for s, e in merged:
+            outage_secs.update(
+                range(
+                    int((s - start).total_seconds()),
+                    int((e - start).total_seconds()),
+                )
+            )
+        supply = sorted(set(range(elapsed)) - outage_secs)
+        pieces = []
+        for x in supply:
+            if pieces and x == pieces[-1][1]:
+                pieces[-1][1] = x + 1
+            else:
+                pieces.append([x, x + 1])
+        brute_caps = [math.floor(rate * (e - s)) for s, e in pieces]
+
+        result = solve_outage_segment(
+            0, r1, r2, start, end, modulus, rate, merged
+        )
+        frags = subtract_outages(start, end, merged)
+        assert [
+            (int((s - start).total_seconds()), int((e - start).total_seconds()))
+            for s, e in frags
+        ] == [(s, e) for s, e in pieces]
+        assert [f.seconds for f in result.fragments] == [e - s for s, e in pieces]
+        assert [f.capacity for f in result.fragments] == brute_caps
+        assert result.supply_seconds == len(supply)
+        assert result.total_capacity == sum(brute_caps)
+
+        diff = r2 - r1
+        k_min = 0 if diff >= 0 else (-diff + modulus - 1) // modulus
+        k_max = (sum(brute_caps) - diff) // modulus
+        assert result.min_wraps == k_min
+        assert result.max_wraps == k_max
+        assert result.feasible == (k_max >= k_min)
+        checked += 1
+    assert checked > 2000

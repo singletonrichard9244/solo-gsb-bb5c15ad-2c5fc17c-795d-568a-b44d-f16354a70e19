@@ -31,6 +31,23 @@
 
     lo_i' == hi_i' 的段圈数唯一，可确定用量；其余段仅保留范围，不猜测。
 
+每日用量上下界（solve_daily_segment）：
+    相邻读数区间按 UTC 午夜切成子段，每段子容量 floor(速率×秒数)，区间
+    总增量须能以非负整数分配到各子段（与下述停水复核同一容量模型）。
+
+停水时段账单复核（solve_outage_segment）：
+    停水时段按左闭右开 [start, end) 处理：先裁剪到读数账期
+    [首读数时刻, 末读数时刻)，再合并重叠或首尾相接的时段。对每对相邻
+    读数，从区间 [t1, t2) 中扣除合并后的停水时段，剩余的每个连续供水
+    片段分别计算容量 c_j = floor(速率 × 片段秒数) 后求和为该段整数
+    用量容量 C = Σ c_j——不跨停水片段合并取整。满足非负增量的回绕
+    圈数 k 仍为连续整数区间：
+        k_min = ceil(max(0, -diff) / M)
+        k_max = floor((C - diff) / M)
+    k_max < k_min 即单段无解（no_feasible_allocation）。各段均可行后，
+    账单总用量联立直接复用 reconcile_total 的整数区间收紧（账单同余
+    冲突 total_incompatible_modulus、总量超界 total_out_of_range）。
+
 换表账单复核（reconcile_meter_total）：
     旧表、新表两段模数 M1、M2 可不同。两段用量分别为
         u1 = d1 + k1*M1, u2 = d2 + k2*M2
@@ -422,6 +439,157 @@ def solve_daily_segment(
         subsegments=subsegments,
         min_usages=tuple(min_usages),
         max_usages=tuple(max_usages),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 停水时段账单复核（outage-reconcile）：裁剪/合并停水时段、供水片段容量
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SupplyFragment:
+    """扣除停水后，读数区间内一个剩余连续供水片段（左闭右开）。"""
+
+    start: datetime
+    end: datetime
+    seconds: int
+    capacity: int  # floor(max_rate_per_second * seconds)，独立取整不跨片段
+
+
+@dataclass(frozen=True)
+class OutageSegmentResult:
+    """一个读数区间扣除停水片段后的可行回绕次数结果。"""
+
+    index: int
+    feasible: bool
+    # 该区间可行的回绕次数范围；无解时 max_wraps < min_wraps
+    min_wraps: int
+    max_wraps: int
+    fragments: Tuple[SupplyFragment, ...]
+
+    @property
+    def supply_seconds(self) -> int:
+        """区间内供水秒数之和（各连续供水片段秒数之和）。"""
+        return sum(f.seconds for f in self.fragments)
+
+    @property
+    def total_capacity(self) -> int:
+        """各供水片段分别 floor(速率×秒数) 取整后求和的整数用量容量。"""
+        return sum(f.capacity for f in self.fragments)
+
+
+def clip_and_merge_intervals(
+    intervals: Sequence[Tuple[datetime, datetime]],
+    bound_start: datetime,
+    bound_end: datetime,
+) -> Tuple[Tuple[datetime, datetime], ...]:
+    """把左闭右开时段先裁剪到账期 ``[bound_start, bound_end)``，再合并。
+
+    1. 裁剪：每个时段取与账期的交集 ``[max(s, bound_start), min(e,
+       bound_end))``，空交集（``cs >= ce``）丢弃；
+    2. 合并：按起点排序后，凡重叠或首尾相接（左闭右开下 ``cur_end >=
+       next_start`` 即相接，相接处既供水又停水均为 0 秒，不影响容量）的
+       时段合并为一个，返回仍按起点排序的不相交时段序列。
+
+    输入时间戳应为已归一化为 UTC 的秒精度带时区时间戳。
+    """
+    clipped = []
+    for start, end in intervals:
+        cs = max(start, bound_start)
+        ce = min(end, bound_end)
+        if cs < ce:
+            clipped.append((cs, ce))
+    clipped.sort()
+
+    merged: list[Tuple[datetime, datetime]] = []
+    for start, end in clipped:
+        if merged and start <= merged[-1][1]:
+            # 重叠或相接（start == 上一段 end）：扩展右端点
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def subtract_outages(
+    start: datetime,
+    end: datetime,
+    outages: Sequence[Tuple[datetime, datetime]],
+) -> Tuple[Tuple[datetime, datetime], ...]:
+    """从左闭右开区间 ``[start, end)`` 中扣除已裁剪合并的停水时段。
+
+    返回剩余连续供水片段的端点序列 ``[(s0, e0), (s1, e1), …]``，零长度
+    片段（区间整体停水或停水恰覆盖一端）被丢弃，秒数之和恰为区间总时长
+    减去落在该区间内的停水秒数。调用方需保证 ``outages`` 两两不相交且已
+    裁剪到包含 ``[start, end)`` 的账期内。
+    """
+    pieces = []
+    cursor = start
+    for o_start, o_end in outages:
+        if o_end <= cursor:
+            continue  # 停水完全在当前位置之前（如落在前一读数区间）
+        if o_start >= end:
+            break  # 停水及之后均超出本区间
+        if o_start > cursor:
+            pieces.append((cursor, o_start))
+        cursor = max(cursor, o_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        pieces.append((cursor, end))
+    return tuple(pieces)
+
+
+def solve_outage_segment(
+    index: int,
+    start_value: int,
+    end_value: int,
+    start: datetime,
+    end: datetime,
+    modulus: int,
+    max_rate_per_second: Fraction,
+    outages: Sequence[Tuple[datetime, datetime]],
+) -> OutageSegmentResult:
+    """扣除停水片段后求单个读数区间的可行回绕次数范围。
+
+    先由 :func:`subtract_outages` 得到剩余连续供水片段，每个片段独立
+    取容量 ``c_j = floor(速率 × 秒数)``，区间整数用量容量为
+    ``C = Σ c_j``（**不跨停水片段合并取整**）。区间真实增量
+    ``delta = diff + k*M`` 须能以非负整数分配到各片段
+    （``0 <= x_j <= c_j``、``Σ x_j = delta``），容量均为整数，故分配
+    存在当且仅当 ``0 <= delta <= C``，可行 ``k`` 仍为连续整数区间：
+
+        k_min = ceil(max(0, -diff) / M)
+        k_max = floor((C - diff) / M)
+
+    ``k_max < k_min`` 即单段无解（``feasible = False``，原因为
+    :data:`REASON_NO_FEASIBLE_ALLOCATION`，与跨日容量模型一致）。
+
+    :param outages: 已裁剪到读数账期并合并的停水时段（UTC、左闭右开）
+    """
+    diff = end_value - start_value
+    fragments = tuple(
+        SupplyFragment(
+            start=s,
+            end=e,
+            seconds=(seconds := int((e - s).total_seconds())),
+            # Fraction 精确取整，各片段独立，不跨停水片段合并
+            capacity=math.floor(max_rate_per_second * seconds),
+        )
+        for s, e in subtract_outages(start, end, outages)
+    )
+    total_capacity = sum(f.capacity for f in fragments)
+
+    k_min = 0 if diff >= 0 else (-diff + modulus - 1) // modulus
+    k_max = (total_capacity - diff) // modulus
+
+    return OutageSegmentResult(
+        index=index,
+        feasible=k_max >= k_min,
+        min_wraps=k_min,
+        max_wraps=k_max,
+        fragments=fragments,
     )
 
 
